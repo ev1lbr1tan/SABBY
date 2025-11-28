@@ -12,7 +12,10 @@ bot = telebot.TeleBot(TOKEN)
 # Инициализация планировщика
 scheduler = BackgroundScheduler()
 
-# Конфигурация базы данных MySQL
+# Глобальная переменная для отслеживания состояния базы данных
+db_available = False
+
+# Конфигурация базы данных MySQL (совместимо с MySQL 9.4)
 DB_CONFIG = {
     'host': os.environ.get('MYSQL_HOST', 'mainline.proxy.rlwy.net'),
     'port': int(os.environ.get('MYSQL_PORT', 15324)),
@@ -20,7 +23,11 @@ DB_CONFIG = {
     'password': os.environ.get('MYSQL_PASSWORD', 'your_password_here'),
     'database': os.environ.get('MYSQL_DATABASE', 'railway'),
     'charset': 'utf8mb4',
-    'cursorclass': pymysql.cursors.DictCursor
+    'cursorclass': pymysql.cursors.DictCursor,
+    'connect_timeout': 10,
+    'read_timeout': 10,
+    'write_timeout': 10,
+    'autocommit': True
 }
 
 def get_db_connection():
@@ -37,7 +44,14 @@ def init_db():
     try:
         connection = get_db_connection()
         if connection is None:
-            print("Не удалось подключиться к базе данных для инициализации")
+            print("❌ ОШИБКА: Не удалось подключиться к базе данных MySQL!")
+            print("Проверьте переменные окружения:")
+            print("- MYSQL_HOST")
+            print("- MYSQL_PORT")
+            print("- MYSQL_USER")
+            print("- MYSQL_PASSWORD")
+            print("- MYSQL_DATABASE")
+            print("\nБот будет работать в ограниченном режиме без сохранения данных.")
             return False
 
         cursor = connection.cursor()
@@ -58,10 +72,15 @@ def init_db():
         connection.commit()
         cursor.close()
         connection.close()
-        print("База данных инициализирована успешно")
+        print("✅ База данных MySQL инициализирована успешно")
+        global db_available
+        db_available = True
         return True
     except Exception as e:
-        print(f"Ошибка при инициализации базы данных: {e}")
+        print(f"❌ ОШИБКА при инициализации базы данных: {e}")
+        print("Бот будет работать в ограниченном режиме без сохранения данных.")
+        global db_available
+        db_available = False
         return False
 
 def get_user_subscriptions(user_id):
@@ -202,9 +221,16 @@ def send_welcome(message):
     markup.row('➕ Добавить подписку', '📋 Мои подписки')
     markup.row('❌ Удалить подписку', '💰 Общая сумма')
     markup.row('❓ Помощь')
-    
-    welcome_text = """
-Привет! Я бот для отслеживания подписок. Вот что я могу:
+
+    # Добавляем информацию о статусе базы данных
+    db_status = "✅ База данных подключена" if db_available else "❌ База данных недоступна - данные не сохраняются"
+
+    welcome_text = f"""
+Привет! Я бот для отслеживания подписок.
+
+{db_status}
+
+Вот что я могу:
 
 ➕ Добавить подписку - Пошаговое добавление новой подписки
 📋 Мои подписки - Показать все ваши подписки
@@ -257,8 +283,8 @@ def add_subscription_handler(message):
         # Расширяем список сервисов
         services = [
             'Netflix', 'Amazon Prime Video', 'Disney+', 'Apple TV+', 'HBO Max', 'Paramount+',
-            'Spotify', 'Apple Music', 'YouTube Music', 'Яндекс.Музыка', 'Deezer', 'Tidal',
-            'КиноПоиск', 'Okko', 'Premier', 'Amediateka', 'More.tv', 'ivi', 'megogo',
+            'Spotify', 'Apple Music', 'YouTube Music', 'Яндекс.Плюс', 'Deezer', 'Tidal',
+            'Okko', 'Premier', 'Amediateka', 'More.tv', 'ivi', 'megogo',
             'Microsoft 365', 'Adobe Creative Cloud', 'Google One', 'iCloud+', 'Dropbox',
             'Другое'
         ]
@@ -326,6 +352,11 @@ def process_renewal_date(message):
         currency = user_states[user_id]['currency']
         cost = user_states[user_id]['cost']
         
+        # Проверяем доступность базы данных
+        if not db_available:
+            bot.reply_to(message, "❌ База данных недоступна. Пожалуйста, настройте подключение к MySQL базе данных в Railway.\n\nИнструкции по настройке:\n1. Создайте базу данных MySQL в Railway\n2. Установите переменные окружения\n3. Перезапустите бота")
+            return
+
         # Добавляем подписку
         success = add_subscription(user_id, service_name, cost, currency, renewal_date)
 
@@ -339,9 +370,9 @@ def process_renewal_date(message):
             markup.row('❌ Удалить подписку', '💰 Общая сумма')
             markup.row('❓ Помощь')
 
-            bot.reply_to(message, f"Подписка '{service_name}' добавлена успешно!", reply_markup=markup)
+            bot.reply_to(message, f"✅ Подписка '{service_name}' добавлена успешно!", reply_markup=markup)
         else:
-            bot.reply_to(message, "Произошла ошибка при добавлении подписки. Проверьте подключение к базе данных.")
+            bot.reply_to(message, "❌ Произошла ошибка при добавлении подписки. Попробуйте еще раз или обратитесь к администратору.")
     except ValueError:
         bot.reply_to(message, "Неверный формат даты. Пожалуйста, используйте формат ГГГГ-ММ-ДД (например, 2023-12-15).")
         bot.register_next_step_handler(message, process_renewal_date)
@@ -351,13 +382,17 @@ def process_renewal_date(message):
 @bot.message_handler(commands=['list'])
 def list_subscriptions(message):
     try:
-        subscriptions = get_subscriptions(message.from_user.id)
-        
-        if not subscriptions:
-            bot.reply_to(message, "У вас нет подписок.")
+        if not db_available:
+            bot.reply_to(message, "❌ База данных недоступна. Невозможно загрузить подписки.")
             return
-        
-        response = "Ваши подписки:\n\n"
+
+        subscriptions = get_subscriptions(message.from_user.id)
+
+        if not subscriptions:
+            bot.reply_to(message, "📝 У вас нет подписок.\n\nИспользуйте ➕ Добавить подписку для создания первой подписки.")
+            return
+
+        response = "📋 Ваши подписки:\n\n"
         for sub in subscriptions:
             # Определяем символ валюты для отображения
             currency_symbols = {
@@ -369,41 +404,53 @@ def list_subscriptions(message):
                 'BYN': 'Br'
             }
             currency_symbol = currency_symbols.get(sub[3], sub[3])  # Используем код валюты, если символ не найден
-            
-            response += f"ID: {sub[0]}\nНазвание: {sub[1]}\nСтоимость: {sub[2]:.2f} {currency_symbol}\nДата обновления: {sub[4]}\n\n"
-        
+
+            response += f"🆔 {sub[0]}\n📺 {sub[1]}\n💰 {sub[2]:.2f} {currency_symbol}\n📅 {sub[4]}\n\n"
+
         bot.reply_to(message, response)
     except Exception as e:
-        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
+        bot.reply_to(message, f"❌ Произошла ошибка при загрузке подписок: {str(e)}")
 
 @bot.message_handler(commands=['delete'])
 def delete_subscription_handler(message):
     try:
+        if not db_available:
+            bot.reply_to(message, "❌ База данных недоступна. Невозможно удалить подписку.")
+            return
+
         msg = bot.reply_to(message, "Введите ID подписки для удаления:")
         bot.register_next_step_handler(msg, process_delete_subscription)
     except Exception as e:
-        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
+        bot.reply_to(message, f"❌ Произошла ошибка: {str(e)}")
 
 def process_delete_subscription(message):
     try:
+        if not db_available:
+            bot.reply_to(message, "❌ База данных недоступна. Невозможно удалить подписку.")
+            return
+
         subscription_id = int(message.text)
         success = delete_subscription(message.from_user.id, subscription_id)
         if success:
-            bot.reply_to(message, f"Подписка с ID {subscription_id} удалена.")
+            bot.reply_to(message, f"✅ Подписка с ID {subscription_id} успешно удалена.")
         else:
-            bot.reply_to(message, "Подписка с таким ID не найдена или произошла ошибка при удалении.")
+            bot.reply_to(message, "❌ Подписка с таким ID не найдена или произошла ошибка при удалении.")
     except ValueError:
-        bot.reply_to(message, "Неверный ID. Пожалуйста, введите числовое значение.")
+        bot.reply_to(message, "❌ Неверный ID. Пожалуйста, введите числовое значение.")
     except Exception as e:
-        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
+        bot.reply_to(message, f"❌ Произошла ошибка при удалении: {str(e)}")
 
 @bot.message_handler(commands=['total'])
 def total_cost(message):
     try:
+        if not db_available:
+            bot.reply_to(message, "❌ База данных недоступна. Невозможно рассчитать общую сумму.")
+            return
+
         subscriptions = get_subscriptions(message.from_user.id)
 
         if not subscriptions:
-            bot.reply_to(message, "У вас нет подписок.")
+            bot.reply_to(message, "📝 У вас нет подписок.\n\nИспользуйте ➕ Добавить подписку для создания первой подписки.")
             return
 
         # Группируем подписки по валютам
@@ -417,7 +464,7 @@ def total_cost(message):
                 currency_totals[currency] = cost
 
         # Формируем ответ
-        response = "Общая стоимость подписок по валютам:\n\n"
+        response = "💰 Общая стоимость подписок по валютам:\n\n"
         currency_symbols = {
             'USD': '$',
             'EUR': '€',
@@ -431,9 +478,11 @@ def total_cost(message):
             symbol = currency_symbols.get(currency, currency)
             response += f"{symbol}{total:.2f} ({currency})\n"
 
+        response += f"\n📊 Всего подписок: {len(subscriptions)}"
+
         bot.reply_to(message, response)
     except Exception as e:
-        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
+        bot.reply_to(message, f"❌ Произошла ошибка при расчете суммы: {str(e)}")
 
 # Функция для отправки уведомлений
 def send_daily_notifications():
