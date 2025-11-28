@@ -1,5 +1,5 @@
 import telebot
-import sqlite3
+import pymysql
 import os
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -12,25 +12,129 @@ bot = telebot.TeleBot(TOKEN)
 # Инициализация планировщика
 scheduler = BackgroundScheduler()
 
-def get_user_db(user_id):
-    """Создает или возвращает базу данных для пользователя"""
-    db_name = f"user_{user_id}.db"
-    conn = sqlite3.connect(db_name)
-    cursor = conn.cursor()
+# Конфигурация базы данных MySQL
+DB_CONFIG = {
+    'host': 'localhost',
+    'port': 3306,
+    'user': 'root',
+    'password': '',
+    'database': 'subscription_bot',
+    'charset': 'utf8mb4',
+    'cursorclass': pymysql.cursors.DictCursor
+}
+
+def get_db_connection():
+    """Создает и возвращает соединение с базой данных MySQL"""
+    connection = pymysql.connect(**DB_CONFIG)
+    return connection
+
+def init_db():
+    """Инициализирует базу данных и создает таблицу подписок, если она не существует"""
+    connection = get_db_connection()
+    cursor = connection.cursor()
     
     # Создание таблицы подписок, если она не существует
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS subscriptions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            service_name TEXT NOT NULL,
-            cost REAL NOT NULL,
-            currency TEXT NOT NULL DEFAULT 'USD',
-            renewal_date DATE NOT NULL
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            service_name VARCHAR(255) NOT NULL,
+            cost DECIMAL(10, 2) NOT NULL,
+            currency VARCHAR(10) NOT NULL DEFAULT 'USD',
+            renewal_date DATE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
-    conn.commit()
-    return conn
+    connection.commit()
+    cursor.close()
+    connection.close()
+
+def get_user_subscriptions(user_id):
+    """Получает все подписки пользователя"""
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        
+        cursor.execute('''
+            SELECT id, service_name, cost, currency, renewal_date
+            FROM subscriptions
+            WHERE user_id = %s
+            ORDER BY renewal_date
+        ''', (user_id,))
+        
+        subscriptions = cursor.fetchall()
+        cursor.close()
+        connection.close()
+        return subscriptions
+    except Exception as e:
+        print(f"Ошибка при получении подписок: {e}")
+        return []
+
+def add_user_subscription(user_id, service_name, cost, currency, renewal_date):
+    """Добавляет новую подписку пользователя в базу данных"""
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    
+    cursor.execute('''
+        INSERT INTO subscriptions (user_id, service_name, cost, currency, renewal_date)
+        VALUES (%s, %s, %s, %s, %s)
+    ''', (user_id, service_name, cost, currency, renewal_date))
+    
+    connection.commit()
+    cursor.close()
+    connection.close()
+
+def delete_user_subscription(user_id, subscription_id):
+    """Удаляет подписку пользователя по ID"""
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    
+    cursor.execute('''
+        DELETE FROM subscriptions
+        WHERE id = %s AND user_id = %s
+    ''', (subscription_id, user_id))
+    
+    connection.commit()
+    cursor.close()
+    connection.close()
+
+def get_user_total_cost(user_id):
+    """Вычисляет общую стоимость всех подписок пользователя"""
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    
+    cursor.execute('''
+        SELECT SUM(cost)
+        FROM subscriptions
+        WHERE user_id = %s
+    ''', (user_id,))
+    
+    result = cursor.fetchone()
+    total = float(result['SUM(cost)']) if result['SUM(cost)'] else 0.0
+    cursor.close()
+    connection.close()
+    return total
+
+def get_upcoming_renewals(user_id, days=7):
+    """Получает подписки пользователя, которые обновляются в течение заданного количества дней"""
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    
+    # Вычисляем дату через заданное количество дней
+    future_date = datetime.now() + timedelta(days=days)
+    
+    cursor.execute('''
+        SELECT service_name, cost, currency, renewal_date
+        FROM subscriptions
+        WHERE user_id = %s AND renewal_date <= %s AND renewal_date >= %s
+        ORDER BY renewal_date
+    ''', (user_id, future_date.strftime('%Y-%m-%d'), datetime.now().strftime('%Y-%m-%d')))
+    
+    upcoming = cursor.fetchall()
+    cursor.close()
+    connection.close()
+    return upcoming
 
 def add_subscription(user_id, service_name, cost, currency, renewal_date):
     """Добавляет новую подписку в базу данных пользователя"""
@@ -156,7 +260,15 @@ def add_subscription_handler(message):
         
         # Создаем клавиатуру с вариантами сервисов
         markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-        services = ['Netflix', 'Spotify', 'YouTube Premium', 'Amazon Prime', 'Apple Music', 'Disney+', 'HBO Max', 'Other']
+        # Расширяем список сервисов
+        services = [
+            'Netflix', 'Amazon Prime Video', 'Disney+', 'Apple TV+', 'HBO Max', 'Paramount+',
+            'Spotify', 'Apple Music', 'YouTube Music', 'Yandex Music', 'Deezer', 'Tidal',
+            'Kinopoisk', 'Okko', 'Premier', 'Amediateka', 'More.tv', 'ivi', 'megogo',
+            'Microsoft 365', 'Adobe Creative Cloud', 'Google One', 'iCloud+', 'Dropbox',
+            'Other'
+        ]
+        # Разбиваем на строки по 2 кнопки
         for i in range(0, len(services), 2):
             if i+1 < len(services):
                 markup.row(services[i], services[i+1])
