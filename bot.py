@@ -5,225 +5,377 @@ from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 
-# ТОКЕН БЕРЁТСЯ ИЗ ПЕРЕМЕННЫХ RAILWAY — НИКОГДА НЕ ХАРДКОДЬ В ПРОДЕ!
-TOKEN = os.environ.get("BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("Не найден BOT_TOKEN в переменных окружения!")
-
+# Инициализация бота
+TOKEN = "8073011044:AAEhiaUcRdumxxOQyi29cRdqTfUygZN5BP8"  # Токен бота от BotFather
 bot = telebot.TeleBot(TOKEN)
 
-# Подключение к MySQL из Railway (автоматически подтягиваются переменные)
+# Инициализация планировщика
+scheduler = BackgroundScheduler()
+
+# Конфигурация базы данных MySQL
 DB_CONFIG = {
-    'host': os.environ['MYSQLHOST'],
-    'port': int(os.environ['MYSQLPORT']),
-    'user': os.environ['MYSQLUSER'],
-    'password': os.environ['MYSQLPASSWORD'],
-    'database': os.environ['MYSQLDATABASE'],
+    'host': 'localhost',
+    'port': 3306,
+    'user': 'root',
+    'password': '',
+    'database': 'subscription_bot',
     'charset': 'utf8mb4',
-    'cursorclass': pymysql.cursors.DictCursor,
-    'autocommit': True
+    'cursorclass': pymysql.cursors.DictCursor
 }
 
 def get_db_connection():
-    return pymysql.connect(**DB_CONFIG)
+    """Создает и возвращает соединение с базой данных MySQL"""
+    connection = pymysql.connect(**DB_CONFIG)
+    return connection
 
-# Инициализация таблиц при старте
 def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    """Инициализирует базу данных и создает таблицу подписок, если она не существует"""
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    
+    # Создание таблицы подписок, если она не существует
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS subscriptions (
             id INT AUTO_INCREMENT PRIMARY KEY,
             user_id BIGINT NOT NULL,
             service_name VARCHAR(255) NOT NULL,
-            cost DECIMAL(10,2) NOT NULL,
-            currency VARCHAR(10) DEFAULT 'USD',
+            cost DECIMAL(10, 2) NOT NULL,
+            currency VARCHAR(10) NOT NULL DEFAULT 'USD',
             renewal_date DATE NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
+    connection.commit()
     cursor.close()
-    conn.close()
+    connection.close()
 
-# === РАБОЧИЕ ФУНКЦИИ ДЛЯ MySQL (все старые удалены!) ===
 def get_user_subscriptions(user_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT id, service_name, cost, currency, renewal_date
-        FROM subscriptions WHERE user_id = %s
-        ORDER BY renewal_date
-    ''', (user_id,))
-    subs = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return subs
+    """Получает все подписки пользователя"""
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        
+        cursor.execute('''
+            SELECT id, service_name, cost, currency, renewal_date
+            FROM subscriptions
+            WHERE user_id = %s
+            ORDER BY renewal_date
+        ''', (user_id,))
+        
+        subscriptions = cursor.fetchall()
+        cursor.close()
+        connection.close()
+        return subscriptions
+    except Exception as e:
+        print(f"Ошибка при получении подписок: {e}")
+        return []
 
-def add_user_subscription(user_id, service_name, cost, currency='USD', renewal_date=None):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+def add_user_subscription(user_id, service_name, cost, currency, renewal_date):
+    """Добавляет новую подписку пользователя в базу данных"""
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    
     cursor.execute('''
         INSERT INTO subscriptions (user_id, service_name, cost, currency, renewal_date)
         VALUES (%s, %s, %s, %s, %s)
     ''', (user_id, service_name, cost, currency, renewal_date))
+    
+    connection.commit()
     cursor.close()
-    conn.close()
+    connection.close()
 
 def delete_user_subscription(user_id, subscription_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM subscriptions WHERE id = %s AND user_id = %s', (subscription_id, user_id))
-    cursor.close()
-    conn.close()
-
-def get_user_total_cost(user_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT COALESCE(SUM(cost), 0) as total FROM subscriptions WHERE user_id = %s', (user_id,))
-    total = cursor.fetchone()['total']
-    cursor.close()
-    conn.close()
-    return float(total)
-
-def get_upcoming_renewals_global(days=7):
-    """Для ежедневной рассылки — возвращает всех пользователей и их ближайшие подписки"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    future_date = (datetime.now() + timedelta(days=days)).date()
-    today = datetime.now().date()
+    """Удаляет подписку пользователя по ID"""
+    connection = get_db_connection()
+    cursor = connection.cursor()
     
     cursor.execute('''
-        SELECT DISTINCT user_id FROM subscriptions
-        WHERE renewal_date BETWEEN %s AND %s
-    ''', (today, future_date))
-    user_ids = [row['user_id'] for row in cursor.fetchall()]
+        DELETE FROM subscriptions
+        WHERE id = %s AND user_id = %s
+    ''', (subscription_id, user_id))
     
-    result = {}
-    for uid in user_ids:
-        cursor.execute('''
-            SELECT service_name, cost, currency, renewal_date
-            FROM subscriptions
-            WHERE user_id = %s AND renewal_date BETWEEN %s AND %s
-            ORDER BY renewal_date
-        ''', (uid, today, future_date))
-        result[uid] = cursor.fetchall()
-    
+    connection.commit()
     cursor.close()
-    conn.close()
-    return result
+    connection.close()
 
-# === КОМАНДЫ ===
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row('Добавить подписку', 'Мои подписки')
-    markup.row('Удалить подписку', 'Общая сумма')
+def get_user_total_cost(user_id):
+    """Вычисляет общую стоимость всех подписок пользователя"""
+    connection = get_db_connection()
+    cursor = connection.cursor()
     
-    bot.reply_to(message, """
-Привет! Я Subby — твой контролёр подписок
+    cursor.execute('''
+        SELECT SUM(cost)
+        FROM subscriptions
+        WHERE user_id = %s
+    ''', (user_id,))
+    
+    result = cursor.fetchone()
+    total = float(result['SUM(cost)']) if result['SUM(cost)'] else 0.0
+    cursor.close()
+    connection.close()
+    return total
 
-Добавить подписку — добавить новую
-Мои подписки — посмотреть список
-Удалить подписку — по ID
-Общая сумма — сколько сгорает в месяц
-    """, reply_markup=markup)
+def get_upcoming_renewals(user_id, days=7):
+    """Получает подписки пользователя, которые обновляются в течение заданного количества дней"""
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    
+    # Вычисляем дату через заданное количество дней
+    future_date = datetime.now() + timedelta(days=days)
+    
+    cursor.execute('''
+        SELECT service_name, cost, currency, renewal_date
+        FROM subscriptions
+        WHERE user_id = %s AND renewal_date <= %s AND renewal_date >= %s
+        ORDER BY renewal_date
+    ''', (user_id, future_date.strftime('%Y-%m-%d'), datetime.now().strftime('%Y-%m-%d')))
+    
+    upcoming = cursor.fetchall()
+    cursor.close()
+    connection.close()
+    return upcoming
 
-# === Добавление подписки (пошагово) ===
+def add_subscription(user_id, service_name, cost, currency, renewal_date):
+    """Добавляет новую подписку в базу данных пользователя"""
+    add_user_subscription(user_id, service_name, cost, currency, renewal_date)
+
+def get_subscriptions(user_id):
+    """Получает все подписки пользователя"""
+    return get_user_subscriptions(user_id)
+
+def delete_subscription(user_id, subscription_id):
+    """Удаляет подписку пользователя по ID"""
+    delete_user_subscription(user_id, subscription_id)
+
+def get_total_cost(user_id):
+    """Вычисляет общую стоимость всех подписок пользователя"""
+    return get_user_total_cost(user_id)
+
+def get_upcoming_renewals(user_id, days=7):
+    """Получает подписки, которые обновляются в течение заданного количества дней"""
+    return get_upcoming_renewals(user_id, days)
+
+# Команды бота
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    # Создаем стильную клавиатуру с кнопками
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row('➕ Добавить подписку', '📋 Мои подписки')
+    markup.row('❌ Удалить подписку', '💰 Общая сумма')
+    markup.row('❓ Помощь')
+    
+    welcome_text = """
+Привет! Я бот для отслеживания подписок. Вот что я могу:
+
+➕ Добавить подписку - Пошаговое добавление новой подписки
+📋 Мои подписки - Показать все ваши подписки
+❌ Удалить подписку - Удалить подписку по ID
+💰 Общая сумма - Показать общую сумму расходов
+❓ Помощь - Показать это сообщение снова
+    """
+    bot.reply_to(message, welcome_text, reply_markup=markup)
+
+@bot.message_handler(commands=['help'])
+def send_help(message):
+    send_welcome(message)
+
+# Добавляем обработчик для кнопки "Добавить подписку"
+@bot.message_handler(func=lambda message: message.text == '➕ Добавить подписку' or message.text == '/add')
+def handle_add_button(message):
+    add_subscription_handler(message)
+
+# Добавляем обработчик для кнопки "Показать все подписки"
+@bot.message_handler(func=lambda message: message.text == '📋 Мои подписки' or message.text == '/list')
+def handle_list_button(message):
+    list_subscriptions(message)
+
+# Добавляем обработчик для кнопки "Удалить подписку"
+@bot.message_handler(func=lambda message: message.text == '❌ Удалить подписку' or message.text == '/delete')
+def handle_delete_button(message):
+    delete_subscription_handler(message)
+
+# Добавляем обработчик для кнопки "Общая сумма"
+@bot.message_handler(func=lambda message: message.text == '💰 Общая сумма' or message.text == '/total')
+def handle_total_button(message):
+    total_cost(message)
+
+# Добавляем обработчик для кнопки "Помощь"
+@bot.message_handler(func=lambda message: message.text == '❓ Помощь' or message.text == '/help')
+def handle_help_button(message):
+    send_help(message)
+
+# Словарь для хранения временных данных пользователя при добавлении подписки
 user_states = {}
 
-@bot.message_handler(func=lambda m: m.text == 'Добавить подписку' or m.text == '/add')
-def add_start(message):
-    user_states[message.from_user.id] = {}
-    markup = telebot.types.ReplyKeyboardRemove()
-    msg = bot.reply_to(message, "Назови сервис (например, Netflix, Я.Плюс, ChatGPT):", reply_markup=markup)
-    bot.register_next_step_handler(msg, step_service)
-
-def step_service(message):
-    user_states[message.from_user.id]['service'] = message.text
-    msg = bot.reply_to(message, "Стоимость в месяц? (например 9.99 или 799)")
-    bot.register_next_step_handler(msg, step_cost)
-
-def step_cost(message):
+@bot.message_handler(commands=['add'])
+def add_subscription_handler(message):
     try:
-        cost = float(message.text.replace(',', '.'))
-        user_states[message.from_user.id]['cost'] = cost
+        # Инициализируем состояние пользователя
+        user_states[message.from_user.id] = {}
+        
+        # Создаем клавиатуру с вариантами сервисов
         markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-        for cur in ['USD', 'RUB', 'EUR', 'UAH']:
-            markup.add(cur)
-        msg = bot.reply_to(message, "Валюта:", reply_markup=markup)
-        bot.register_next_step_handler(msg, step_currency)
-    except:
-        bot.reply_to(message, "Введи число")
-        bot.register_next_step_handler(message, step_cost)
+        # Расширяем список сервисов
+        services = [
+            'Netflix', 'Amazon Prime Video', 'Disney+', 'Apple TV+', 'HBO Max', 'Paramount+',
+            'Spotify', 'Apple Music', 'YouTube Music', 'Яндекс.Музыка', 'Deezer', 'Tidal',
+            'КиноПоиск', 'Okko', 'Premier', 'Amediateka', 'More.tv', 'ivi', 'megogo',
+            'Microsoft 365', 'Adobe Creative Cloud', 'Google One', 'iCloud+', 'Dropbox',
+            'Другое'
+        ]
+        # Разбиваем на строки по 2 кнопки
+        for i in range(0, len(services), 2):
+            if i+1 < len(services):
+                markup.row(services[i], services[i+1])
+            else:
+                markup.row(services[i])
+        
+        msg = bot.reply_to(message, "Выберите сервис или введите свой:", reply_markup=markup)
+        bot.register_next_step_handler(msg, process_service_name)
+    except Exception as e:
+        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
 
-def step_currency(message):
-    user_states[message.from_user.id]['currency'] = message.text.upper()
-    msg = bot.reply_to(message, "Дата следующего списания (ГГГГ-ММ-ДД):")
-    bot.register_next_step_handler(msg, step_date)
-
-def step_date(message):
-    uid = message.from_user.id
+def process_service_name(message):
     try:
-        date_obj = datetime.strptime(message.text, '%Y-%m-%d').date()
-        data = user_states[uid]
-        add_user_subscription(uid, data['service'], data['cost'], data['currency'], date_obj)
-        bot.reply_to(message, f"Подписка «{data['service']}» добавлена!")
-        del user_states[uid]
-    except:
-        bot.reply_to(message, "Неверная дата, формат ГГГГ-ММ-ДД")
-        bot.register_next_step_handler(message, step_date)
+        user_states[message.from_user.id]['service_name'] = message.text
+        
+        # Создаем клавиатуру с валютами
+        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        currencies = ['USD', 'EUR', 'RUB', 'UAH', 'KZT', 'BYN']
+        markup.row('USD', 'EUR')
+        markup.row('RUB', 'UAH')
+        markup.row('KZT', 'BYN')
+        
+        msg = bot.reply_to(message, "Выберите валюту:", reply_markup=markup)
+        bot.register_next_step_handler(msg, process_currency)
+    except Exception as e:
+        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
 
-# === Остальные команды ===
-@bot.message_handler(func=lambda m: m.text in ['Мои подписки', '/list'])
-def list_subs(message):
-    subs = get_user_subscriptions(message.from_user.id)
-    if not subs:
-        bot.reply_to(message, "Подписки пусто")
-        return
-    
-    text = "Твои подписки:\n\n"
-    for s in subs:
-        sym = {'USD':'$', 'RUB':'₽', 'EUR':'€', 'UAH':'₴'}.get(s['currency'], s['currency'])
-        text += f"ID: <code>{s['id']}</code>\n{s['service_name']} — {s['cost']} {sym} — {s['renewal_date']}\n\n"
-    bot.reply_to(message, text, parse_mode='HTML')
-
-@bot.message_handler(func=lambda m: m.text in ['Удалить подписку', '/delete'])
-def delete_start(message):
-    msg = bot.reply_to(message, "Введи ID подписки для удаления:")
-    bot.register_next_step_handler(msg, delete_process)
-
-def delete_process(message):
+def process_currency(message):
     try:
-        sub_id = int(message.text)
-        delete_user_subscription(message.from_user.id, sub_id)
-        bot.reply_to(message, "Удалено")
-    except:
-        bot.reply_to(message, "Ошибка ID")
+        user_states[message.from_user.id]['currency'] = message.text
+        
+        # Запрашиваем стоимость подписки
+        msg = bot.reply_to(message, "Введите стоимость подписки:")
+        bot.register_next_step_handler(msg, process_cost)
+    except Exception as e:
+        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
 
-@bot.message_handler(func=lambda m: m.text in ['Общая сумма', '/total'])
-def total(message):
-    total = get_user_total_cost(message.from_user.id)
-    bot.reply_to(message, f"В месяц улетает: {total:.2f} (сумма по всем валютам в числах)")
+def process_cost(message):
+    try:
+        cost = float(message.text)
+        user_states[message.from_user.id]['cost'] = cost
+        
+        # Запрашиваем дату обновления
+        msg = bot.reply_to(message, "Введите дату обновления подписки в формате ГГГГ-ММ-ДД (например, 2023-12-15):")
+        bot.register_next_step_handler(msg, process_renewal_date)
+    except ValueError:
+        bot.reply_to(message, "Неверный формат стоимости. Пожалуйста, введите число.")
+        bot.register_next_step_handler(message, process_cost)
+    except Exception as e:
+        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
 
-# === Ежедневные напоминания ===
-def daily_reminders():
-    upcoming = get_upcoming_renewals_global(days=7)
-    for user_id, subs in upcoming.items():
-        try:
-            text = "Скоро спишут:\n\n"
-            for s in subs:
-                sym = {'USD':'$', 'RUB':'₽', 'EUR':'€', 'UAH':'₴'}.get(s['currency'], s['currency'])
-                text += f"• {s['service_name']} — {s['cost']} {sym} — {s['renewal_date']}\n"
-            bot.send_message(user_id, text)
-        except:
-            pass  # пользователь заблокировал бота
+def process_renewal_date(message):
+    try:
+        # Проверяем формат даты
+        renewal_date = message.text
+        datetime.strptime(renewal_date, '%Y-%m-%d')
+        
+        # Получаем данные из состояния пользователя
+        user_id = message.from_user.id
+        service_name = user_states[user_id]['service_name']
+        currency = user_states[user_id]['currency']
+        cost = user_states[user_id]['cost']
+        
+        # Добавляем подписку
+        add_subscription(user_id, service_name, cost, currency, renewal_date)
+        
+        # Очищаем состояние пользователя
+        del user_states[user_id]
+        
+        # Возвращаем стандартную клавиатуру
+        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.row('/add', '/list')
+        markup.row('/delete', '/total')
+        markup.row('/help')
+        
+        bot.reply_to(message, f"Подписка '{service_name}' добавлена успешно!", reply_markup=markup)
+    except ValueError:
+        bot.reply_to(message, "Неверный формат даты. Пожалуйста, используйте формат ГГГГ-ММ-ДД (например, 2023-12-15).")
+        bot.register_next_step_handler(message, process_renewal_date)
+    except Exception as e:
+        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
 
-scheduler = BackgroundScheduler()
-scheduler.add_job(daily_reminders, 'cron', hour=9, minute=0)  # 9:00 UTC
+@bot.message_handler(commands=['list'])
+def list_subscriptions(message):
+    try:
+        subscriptions = get_subscriptions(message.from_user.id)
+        
+        if not subscriptions:
+            bot.reply_to(message, "У вас нет подписок.")
+            return
+        
+        response = "Ваши подписки:\n\n"
+        for sub in subscriptions:
+            # Определяем символ валюты для отображения
+            currency_symbols = {
+                'USD': '$',
+                'EUR': '€',
+                'RUB': '₽',
+                'UAH': '₴',
+                'KZT': '₸',
+                'BYN': 'Br'
+            }
+            currency_symbol = currency_symbols.get(sub[3], sub[3])  # Используем код валюты, если символ не найден
+            
+            response += f"ID: {sub[0]}\nНазвание: {sub[1]}\nСтоимость: {sub[2]:.2f} {currency_symbol}\nДата обновления: {sub[4]}\n\n"
+        
+        bot.reply_to(message, response)
+    except Exception as e:
+        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
+
+@bot.message_handler(commands=['delete'])
+def delete_subscription_handler(message):
+    try:
+        msg = bot.reply_to(message, "Введите ID подписки для удаления:")
+        bot.register_next_step_handler(msg, process_delete_subscription)
+    except Exception as e:
+        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
+
+def process_delete_subscription(message):
+    try:
+        subscription_id = int(message.text)
+        delete_subscription(message.from_user.id, subscription_id)
+        bot.reply_to(message, f"Подписка с ID {subscription_id} удалена.")
+    except ValueError:
+        bot.reply_to(message, "Неверный ID. Пожалуйста, введите числовое значение.")
+    except Exception as e:
+        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
+
+@bot.message_handler(commands=['total'])
+def total_cost(message):
+    try:
+        total = get_total_cost(message.from_user.id)
+        bot.reply_to(message, f"Общая стоимость всех подписок: ${total:.2f}")
+    except Exception as e:
+        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
+
+# Функция для отправки уведомлений
+def send_daily_notifications():
+    # В реальной реализации здесь нужно будет пройтись по всем пользователям
+    # Для простоты в этом примере мы не реализуем механизм отслеживания пользователей
+    # В production-среде вы можете хранить список пользователей в отдельной таблице
+    pass
+
+# Запуск планировщика
+scheduler.add_job(send_daily_notifications, 'cron', hour=9, minute=0)  # Ежедневно в 9:00 UTC
 scheduler.start()
+
+# Регистрируем функцию остановки планировщика при завершении работы
 atexit.register(lambda: scheduler.shutdown())
 
-# === ЗАПУСК ===
-init_db()  # создаём таблицу при старте
-print("Subby запущен и готов сосать деньги из подписок")
-bot.infinity_polling()
+# Запуск бота
+if __name__ == "__main__":
+    print("Бот запущен...")
+    bot.polling(none_stop=True)
