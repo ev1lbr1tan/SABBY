@@ -73,13 +73,11 @@ def init_db():
         cursor.close()
         connection.close()
         print("✅ База данных MySQL инициализирована успешно")
-        global db_available
         db_available = True
         return True
     except Exception as e:
         print(f"❌ ОШИБКА при инициализации базы данных: {e}")
         print("Бот будет работать в ограниченном режиме без сохранения данных.")
-        global db_available
         db_available = False
         return False
 
