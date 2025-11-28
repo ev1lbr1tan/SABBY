@@ -6,7 +6,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 
 # Инициализация бота
-TOKEN = "8073011044:AAEhiaUcRdumxxOQyi29cRdqTfUygZN5BP8"  # Токен бота от BotFather
+TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8073011044:AAEhiaUcRdumxxOQyi29cRdqTfUygZN5BP8')  # Токен бота от BotFather
 bot = telebot.TeleBot(TOKEN)
 
 # Инициализация планировщика
@@ -14,19 +14,23 @@ scheduler = BackgroundScheduler()
 
 # Конфигурация базы данных MySQL
 DB_CONFIG = {
-    'host': 'localhost',
-    'port': 3306,
-    'user': 'root',
-    'password': '',
-    'database': 'subscription_bot',
+    'host': os.environ.get('MYSQL_HOST', 'mainline.proxy.rlwy.net'),
+    'port': int(os.environ.get('MYSQL_PORT', 15324)),
+    'user': os.environ.get('MYSQL_USER', 'root'),
+    'password': os.environ.get('MYSQL_PASSWORD', 'your_password_here'),
+    'database': os.environ.get('MYSQL_DATABASE', 'railway'),
     'charset': 'utf8mb4',
     'cursorclass': pymysql.cursors.DictCursor
 }
 
 def get_db_connection():
     """Создает и возвращает соединение с базой данных MySQL"""
-    connection = pymysql.connect(**DB_CONFIG)
-    return connection
+    try:
+        connection = pymysql.connect(**DB_CONFIG)
+        return connection
+    except pymysql.Error as e:
+        print(f"Ошибка подключения к MySQL: {e}")
+        return None
 
 def init_db():
     """Инициализирует базу данных и создает таблицу подписок, если она не существует"""
@@ -73,17 +77,24 @@ def get_user_subscriptions(user_id):
 
 def add_user_subscription(user_id, service_name, cost, currency, renewal_date):
     """Добавляет новую подписку пользователя в базу данных"""
-    connection = get_db_connection()
-    cursor = connection.cursor()
-    
-    cursor.execute('''
-        INSERT INTO subscriptions (user_id, service_name, cost, currency, renewal_date)
-        VALUES (%s, %s, %s, %s, %s)
-    ''', (user_id, service_name, cost, currency, renewal_date))
-    
-    connection.commit()
-    cursor.close()
-    connection.close()
+    try:
+        connection = get_db_connection()
+        if connection is None:
+            return False
+        cursor = connection.cursor()
+
+        cursor.execute('''
+            INSERT INTO subscriptions (user_id, service_name, cost, currency, renewal_date)
+            VALUES (%s, %s, %s, %s, %s)
+        ''', (user_id, service_name, cost, currency, renewal_date))
+
+        connection.commit()
+        cursor.close()
+        connection.close()
+        return True
+    except Exception as e:
+        print(f"Ошибка при добавлении подписки: {e}")
+        return False
 
 def delete_user_subscription(user_id, subscription_id):
     """Удаляет подписку пользователя по ID"""
@@ -101,20 +112,26 @@ def delete_user_subscription(user_id, subscription_id):
 
 def get_user_total_cost(user_id):
     """Вычисляет общую стоимость всех подписок пользователя"""
-    connection = get_db_connection()
-    cursor = connection.cursor()
-    
-    cursor.execute('''
-        SELECT SUM(cost)
-        FROM subscriptions
-        WHERE user_id = %s
-    ''', (user_id,))
-    
-    result = cursor.fetchone()
-    total = float(result['SUM(cost)']) if result['SUM(cost)'] else 0.0
-    cursor.close()
-    connection.close()
-    return total
+    try:
+        connection = get_db_connection()
+        if connection is None:
+            return 0.0
+        cursor = connection.cursor()
+
+        cursor.execute('''
+            SELECT SUM(cost)
+            FROM subscriptions
+            WHERE user_id = %s
+        ''', (user_id,))
+
+        result = cursor.fetchone()
+        total = float(result['SUM(cost)']) if result['SUM(cost)'] else 0.0
+        cursor.close()
+        connection.close()
+        return total
+    except Exception as e:
+        print(f"Ошибка при получении общей стоимости: {e}")
+        return 0.0
 
 def get_upcoming_renewals(user_id, days=7):
     """Получает подписки пользователя, которые обновляются в течение заданного количества дней"""
@@ -138,7 +155,7 @@ def get_upcoming_renewals(user_id, days=7):
 
 def add_subscription(user_id, service_name, cost, currency, renewal_date):
     """Добавляет новую подписку в базу данных пользователя"""
-    add_user_subscription(user_id, service_name, cost, currency, renewal_date)
+    return add_user_subscription(user_id, service_name, cost, currency, renewal_date)
 
 def get_subscriptions(user_id):
     """Получает все подписки пользователя"""
@@ -346,8 +363,11 @@ def delete_subscription_handler(message):
 def process_delete_subscription(message):
     try:
         subscription_id = int(message.text)
-        delete_subscription(message.from_user.id, subscription_id)
-        bot.reply_to(message, f"Подписка с ID {subscription_id} удалена.")
+        success = delete_subscription(message.from_user.id, subscription_id)
+        if success:
+            bot.reply_to(message, f"Подписка с ID {subscription_id} удалена.")
+        else:
+            bot.reply_to(message, "Произошла ошибка при удалении подписки. Проверьте подключение к базе данных.")
     except ValueError:
         bot.reply_to(message, "Неверный ID. Пожалуйста, введите числовое значение.")
     except Exception as e:
